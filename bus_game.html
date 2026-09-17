@@ -260,6 +260,9 @@ details pre {
       <input type="range" id="snd-volume" min="0" max="100" value="35" style="width:120px">
     </label>
   </div>
+  <div class="setting-row">
+    <label><input type="checkbox" id="chk-save" checked> Сохранять настройки</label>
+  </div>
 
   <details>
     <summary>Пример мода (нажмите, чтобы развернуть)</summary>
@@ -1156,6 +1159,7 @@ const Mods = {
 
     let obj;
     try {
+      this._currentModName = data.name;
       const ctx = {
         // === core ===
         THREE: window.THREE, roundedBox, GAME,
@@ -1177,6 +1181,15 @@ const Mods = {
 
         // === регистрация новых мод-типов «на лету» ===
         registerMod: (d) => window.registerMod(d),
+
+        // === ModAPI для полного контроля ===
+        addHudButton: (cfg) => Mods.addHudButton(cfg),
+        addMenuItem: (cfg) => Mods.addMenuItem(cfg),
+        addCameraMode: (cfg) => Mods.addCameraMode(cfg),
+        addGameMode: (cfg) => Mods.addGameMode(cfg),
+        injectCSS: (css) => Mods.injectCSS(css),
+        onEvent: (ev, cb) => Mods.on(ev, cb),
+        emitEvent: (ev, data) => Mods.emit(ev, data),
 
         // === дорога ===
         roadCenterX, roadAngle,
@@ -1204,6 +1217,8 @@ const Mods = {
       console.error(e);
       toast('Ошибка сборки мода: ' + e.message, 2800);
       return false;
+    } finally {
+      this._currentModName = null;
     }
 
     data._cell = this._currentCell || null;
@@ -1398,6 +1413,9 @@ const Mods = {
     if (data._cell && data._cell.parentNode) {
       data._cell.parentNode.removeChild(data._cell);
     }
+
+    // Очистка элементов, созданных через ModAPI
+    this._cleanupModElements(name);
 
     toast(`Мод «${name}» выгружен`);
     return true;
@@ -1657,45 +1675,184 @@ const Mods = {
     cell.className = 'config-cell';
     cell.innerHTML = '<span class="plus">+</span><div class="hint">Нажмите, чтобы выбрать .js</div>';
   },
+
+  // === ModAPI: полный контроль ===
+  _eventBus: {},
+  _cameraModes: [],    // { id, name, update }
+  _gameModes: [],      // { id, name, onEnter, onExit, onFrame, active }
+  _modElements: {},    // modName -> [elements]
+  _currentModName: null,
+  _nextId: 1,
+
+  _genId() { return 'mid_' + (this._nextId++); },
+
+  on(event, cb) {
+    if (!this._eventBus[event]) this._eventBus[event] = [];
+    const handler = { modName: this._currentModName, cb };
+    this._eventBus[event].push(handler);
+    return { remove: () => {
+      const arr = this._eventBus[event];
+      if (arr) { const i = arr.indexOf(handler); if (i >= 0) arr.splice(i, 1); }
+    }};
+  },
+
+  emit(event, data) {
+    const arr = this._eventBus[event];
+    if (arr) arr.forEach(h => { try { h.cb(data); } catch(e) { console.error('ModAPI.emit:', e); } });
+  },
+
+  addHudButton({id, label, onClick, position}) {
+    const modName = this._currentModName || 'unknown';
+    const hud = document.getElementById('hud');
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.id = id || 'mod-hud-btn-' + Math.random().toString(36).slice(2);
+    btn.setAttribute('data-mod', modName);
+    btn.style.cssText = 
+      'position:absolute; padding:8px 16px; border-radius:8px; border:none;' +
+      'background:rgba(0,0,0,.7); color:#fff; font-size:14px; cursor:pointer;' +
+      'box-shadow:0 2px 8px rgba(0,0,0,.5); pointer-events:auto;';
+    const posMap = {
+      'top-left': {top:'16px', left:'16px'},
+      'top-right': {top:'16px', right:'16px'},
+      'bottom-left': {bottom:'16px', left:'16px'},
+      'bottom-right': {bottom:'16px', right:'16px'}
+    };
+    const p = posMap[position] || posMap['top-left'];
+    Object.assign(btn.style, p);
+    btn.onclick = onClick;
+    hud.appendChild(btn);
+    this._trackElement(modName, btn);
+    return {
+      remove: () => { if (btn.parentNode) btn.parentNode.removeChild(btn); },
+      element: btn
+    };
+  },
+
+  addMenuItem({label, onClick, parent}) {
+    const modName = this._currentModName || 'unknown';
+    const container = document.getElementById(parent === 'settings' ? 'settings' : 'menu');
+    const btn = document.createElement('button');
+    btn.className = 'btn-gray';
+    btn.textContent = label;
+    btn.setAttribute('data-mod', modName);
+    btn.onclick = onClick;
+    container.insertBefore(btn, container.querySelector('details') || null);
+    this._trackElement(modName, btn);
+    return {
+      remove: () => { if (btn.parentNode) btn.parentNode.removeChild(btn); },
+      element: btn
+    };
+  },
+
+  addCameraMode({name, update}) {
+    const modName = this._currentModName || 'unknown';
+    if (typeof update !== 'function') return { remove: () => {} };
+    const id = this._genId();
+    GAME.cameraNames.push(name);
+    const mode = { id, name, update, modName };
+    this._cameraModes.push(mode);
+    return {
+      remove: () => {
+        const i = GAME.cameraNames.indexOf(name);
+        if (i >= 0) GAME.cameraNames.splice(i, 1);
+        const idx = this._cameraModes.findIndex(m => m.id === id);
+        if (idx >= 0) this._cameraModes.splice(idx, 1);
+      },
+      name: name,
+      id: id
+    };
+  },
+
+  addGameMode({name, onEnter, onExit, onFrame}) {
+    const modName = this._currentModName || 'unknown';
+    const id = this._genId();
+    const mode = { id, name, onEnter, onExit, onFrame, active: false, modName };
+    this._gameModes.push(mode);
+    return {
+      remove: () => {
+        const idx = this._gameModes.findIndex(m => m.id === id);
+        if (idx >= 0) {
+          if (this._gameModes[idx].active) this.deactivateGameMode(this._gameModes[idx]);
+          this._gameModes.splice(idx, 1);
+        }
+      },
+      activate: () => this.activateGameMode(mode),
+      deactivate: () => this.deactivateGameMode(mode),
+      mode: mode,
+      id: id
+    };
+  },
+
+  activateGameMode(mode) {
+    if (mode.active) return;
+    mode.active = true;
+    // Deactivate all other modes first
+    this._gameModes.forEach(m => {
+      if (m !== mode && m.active) this.deactivateGameMode(m);
+    });
+    if (typeof mode.onEnter === 'function') {
+      try { mode.onEnter(); } catch(e) { console.error('GameMode.onEnter:', e); }
+    }
+  },
+
+  deactivateGameMode(mode) {
+    if (!mode.active) return;
+    mode.active = false;
+    if (typeof mode.onExit === 'function') {
+      try { mode.onExit(); } catch(e) { console.error('GameMode.onExit:', e); }
+    }
+  },
+
+  injectCSS(css) {
+    const modName = this._currentModName || 'unknown';
+    const style = document.createElement('style');
+    style.setAttribute('data-mod', modName);
+    style.textContent = css;
+    document.head.appendChild(style);
+    this._trackElement(modName, style);
+    return {
+      remove: () => { if (style.parentNode) style.parentNode.removeChild(style); },
+      element: style
+    };
+  },
+
+  _trackElement(modName, el) {
+    if (!this._modElements[modName]) this._modElements[modName] = [];
+    this._modElements[modName].push(el);
+  },
+
+  _cleanupModElements(modName) {
+    const els = this._modElements[modName] || [];
+    els.forEach(el => { if (el.remove) el.remove(); });
+    delete this._modElements[modName];
+    
+    // Очищаем также event handlers для этого мода
+    Object.keys(this._eventBus).forEach(ev => {
+      this._eventBus[ev] = this._eventBus[ev].filter(h => h.modName !== modName);
+    });
+    
+    // Очищаем camera modes для этого мода
+    for (let i = this._cameraModes.length - 1; i >= 0; i--) {
+      if (this._cameraModes[i].modName === modName) {
+        const name = this._cameraModes[i].name;
+        const ni = GAME.cameraNames.indexOf(name);
+        if (ni >= 0) GAME.cameraNames.splice(ni, 1);
+        this._cameraModes.splice(i, 1);
+      }
+    }
+    
+    // Очищаем game modes для этого мода
+    for (let i = this._gameModes.length - 1; i >= 0; i--) {
+      if (this._gameModes[i].modName === modName) {
+        if (this._gameModes[i].active) this.deactivateGameMode(this._gameModes[i]);
+        this._gameModes.splice(i, 1);
+      }
+    }
+  }
 };
 
 window.registerMod = (data) => Mods.register(data);
-
-/* ==================== FULL GLOBAL EXPOSURE ====================
-   Моды имеют полный доступ ко всему — без изоляции.
-   ============================================================== */
-window.THREE        = window.THREE || THREE;
-window.roundedBox   = roundedBox;
-window.toast        = toast;
-window.Mods         = Mods;
-window.GAME         = GAME;
-window.Input        = Input;
-window.Wheel        = Wheel;
-window.Pedals       = Pedals;
-window.UI           = UI;
-window.Minimap      = Minimap;
-window.EngineSound  = EngineSound;
-window.roadCenterX  = roadCenterX;
-window.roadAngle    = roadAngle;
-window.escapeHtml   = escapeHtml;
-window.roundRectPath = roundRectPath;
-window.setupCanvas  = setupCanvas;
-window.makeSmokeTexture = makeSmokeTexture;
-window.makeFireTexture  = makeFireTexture;
-window.makeProceduralEnvMap = makeProceduralEnvMap;
-window.makeSkyDome  = makeSkyDome;
-window.prepareGLBBus = prepareGLBBus;
-window.prepareGLBMap = prepareGLBMap;
-window.mergeMapByMaterial = mergeMapByMaterial;
-window.upgradeMapMaterial = upgradeMapMaterial;
-
-/* Константы мира */
-Object.assign(window, {
-  WORLD_LEN, ROAD_HALF, BARRIER_X,
-  MAP_MIN_Z, MAP_MAX_Z, MAP_MIN_X, MAP_MAX_X,
-  CURVE_FREQ, CURVE_AMP, CURVE_FREQ2, CURVE_AMP2, CURVE_FREQ3, CURVE_AMP3,
-  ROAD_SEG_LEN, ROAD_SEG_COUNT,
-});
 
 /* ==================== STEERING WHEEL ==================== */
 const Wheel = {
@@ -2476,6 +2633,9 @@ const GAME = {
     canvas.addEventListener('pointerleave', (e) => {
       if (e.buttons === 0) endOrbitDrag();
     });
+
+    // Загрузка состояния из localStorage после setBusModel
+    this.loadState();
   },
 
   _callModHook(mod, hook, ...args) {
@@ -3032,6 +3192,111 @@ const GAME = {
     }
   },
 
+  saveState() {
+    const chk = document.getElementById('chk-save');
+    if (!chk || !chk.checked) return;
+
+    const state = {
+      bounds: { ...this._bounds },
+      gfx: { bicycle: this.gfx.bicycle, weight: this.gfx.weight, bloom: this.gfx.bloom },
+      engine: { volume: EngineSound.volume, enabled: EngineSound.enabled },
+      wheel: { autoReturn: Wheel.autoReturn },
+      questText: this._questText,
+      busPos: this.bus ? { x: this.bus.position.x, z: this.bus.position.z, ry: this.bus.rotation.y } : null,
+      mods: Object.keys(Mods.registry)
+    };
+
+    try {
+      localStorage.setItem('busgame_state_v1', JSON.stringify(state));
+    } catch (e) {
+      console.warn('localStorage save failed:', e);
+    }
+  },
+
+  loadState() {
+    let raw;
+    try {
+      raw = localStorage.getItem('busgame_state_v1');
+    } catch (e) {
+      return false;
+    }
+    if (!raw) return false;
+
+    let state;
+    try {
+      state = JSON.parse(raw);
+    } catch (e) {
+      console.warn('localStorage parse failed:', e);
+      return false;
+    }
+
+    // Применяем настройки
+    if (state.bounds) {
+      const b = state.bounds;
+      if (typeof b.minZ === 'number') this._bounds.minZ = b.minZ;
+      if (typeof b.maxZ === 'number') this._bounds.maxZ = b.maxZ;
+      if (typeof b.minX === 'number') this._bounds.minX = b.minX;
+      if (typeof b.maxX === 'number') this._bounds.maxX = b.maxX;
+    }
+
+    if (state.gfx) {
+      if (typeof state.gfx.bicycle === 'boolean') this.gfx.bicycle = state.gfx.bicycle;
+      if (typeof state.gfx.weight === 'boolean') this.gfx.weight = state.gfx.weight;
+      if (typeof state.gfx.bloom === 'boolean') {
+        this.gfx.bloom = state.gfx.bloom;
+        if (this.bloomPass) this.bloomPass.enabled = state.gfx.bloom;
+      }
+    }
+
+    if (state.engine) {
+      if (typeof state.engine.volume === 'number') {
+        EngineSound.volume = Math.max(0, Math.min(1, state.engine.volume));
+        const slider = document.getElementById('snd-volume');
+        if (slider) slider.value = EngineSound.volume * 100;
+      }
+      if (typeof state.engine.enabled === 'boolean') {
+        EngineSound.enabled = state.engine.enabled;
+        const chk = document.getElementById('chk-sound');
+        if (chk) chk.checked = state.engine.enabled;
+      }
+    }
+
+    if (state.wheel && typeof state.wheel.autoReturn === 'boolean') {
+      Wheel.autoReturn = state.wheel.autoReturn;
+      const chk = document.getElementById('chk-autoreturn');
+      if (chk) chk.checked = state.wheel.autoReturn;
+    }
+
+    if (typeof state.questText === 'string') {
+      this._questText = state.questText;
+      const el = document.getElementById('quest-display');
+      if (el) {
+        if (this._questText) {
+          el.textContent = this._questText;
+          el.classList.add('show');
+        } else {
+          el.classList.remove('show');
+        }
+      }
+    }
+
+    // Синхронизация UI с загруженным состоянием
+    const $ = id => document.getElementById(id);
+    if ($('chk-bicycle')) $('chk-bicycle').checked = state.gfx?.bicycle ?? false;
+    if ($('chk-weight')) $('chk-weight').checked = state.gfx?.weight ?? false;
+    if ($('chk-bloom')) $('chk-bloom').checked = state.gfx?.bloom ?? false;
+
+    // Восстанавливаем позицию автобуса только если игра запущена
+    if (this.started && state.busPos && this.bus) {
+      if (typeof state.busPos.x === 'number') this.bus.position.x = state.busPos.x;
+      if (typeof state.busPos.z === 'number') this.bus.position.z = state.busPos.z;
+      if (typeof state.busPos.ry === 'number') this.bus.rotation.y = state.busPos.ry;
+    }
+
+    toast('Состояние загружено');
+    return true;
+  },
+
   triggerAccident() {
     if (this.accident) return;
     this.accident = true;
@@ -3560,6 +3825,8 @@ const GAME = {
     this._callModHook(this._activeBusMod, 'onStop', { GAME: this });
     this._callModHook(this._activeMapMod, 'onStop', { GAME: this });
     this._callModHook(this._activeTrafficMod, 'onStop', { GAME: this });
+
+    this.saveState();
   },
 
   pause(v) {
@@ -3570,6 +3837,7 @@ const GAME = {
     this._callModHook(this._activeTrafficMod, hook, { GAME: this });
     if (v) EngineSound.stop();
     else   EngineSound.resume();
+    if (v) this.saveState();
   },
 
   cycleCamera() {
@@ -3892,7 +4160,14 @@ const GAME = {
     const busPos = this.bus.position;
     const k = 1 - Math.pow(0.0015, dt);
 
-    if (this.cameraMode === 0) {
+    // Проверяем кастомные режимы камеры от модов
+    if (this.cameraMode >= 4 && Mods._cameraModes[this.cameraMode - 4]) {
+      const mode = Mods._cameraModes[this.cameraMode - 4];
+      if (mode && typeof mode.update === 'function') {
+        try { mode.update(dt, this.bus, this.camera); }
+        catch (e) { console.error('Custom camera mode error:', e); }
+      }
+    } else if (this.cameraMode === 0) {
       this.camera.up.set(0, 1, 0);
       const off = new THREE.Vector3(0, 6.2, -14).applyEuler(this.bus.rotation);
       const desired = new THREE.Vector3().copy(busPos).add(off);
@@ -3965,6 +4240,16 @@ const GAME = {
       this.update(dt);
       this.updateCamera(dt);
 
+      // Вызываем onFrame для кастомных игровых режимов от модов (только активные)
+      if (Mods._gameModes.length > 0) {
+        for (const mode of Mods._gameModes) {
+          if (mode && mode.active && typeof mode.onFrame === 'function') {
+            try { mode.onFrame(dt, this); }
+            catch (e) { console.error('GameMode.onFrame error:', e); }
+          }
+        }
+      }
+
       if (this.skyDome) this.skyDome.position.copy(this.camera.position);
 
       if (this.composer) {
@@ -3996,6 +4281,42 @@ window.addEventListener('load', () => {
   if (accEl) accEl.classList.add('hidden');
 
   GAME.loop();
+});
+
+/* ==================== FULL GLOBAL EXPOSURE ====================
+   Моды имеют полный доступ ко всему — без изоляции.
+   ============================================================== */
+window.THREE        = window.THREE || THREE;
+window.roundedBox   = roundedBox;
+window.toast        = toast;
+window.Mods         = Mods;
+window.GAME         = GAME;
+window.Input        = Input;
+window.Wheel        = Wheel;
+window.Pedals       = Pedals;
+window.UI           = UI;
+window.Minimap      = Minimap;
+window.EngineSound  = EngineSound;
+window.roadCenterX  = roadCenterX;
+window.roadAngle    = roadAngle;
+window.escapeHtml   = escapeHtml;
+window.roundRectPath = roundRectPath;
+window.setupCanvas  = setupCanvas;
+window.makeSmokeTexture = makeSmokeTexture;
+window.makeFireTexture  = makeFireTexture;
+window.makeProceduralEnvMap = makeProceduralEnvMap;
+window.makeSkyDome  = makeSkyDome;
+window.prepareGLBBus = prepareGLBBus;
+window.prepareGLBMap = prepareGLBMap;
+window.mergeMapByMaterial = mergeMapByMaterial;
+window.upgradeMapMaterial = upgradeMapMaterial;
+
+/* Константы мира */
+Object.assign(window, {
+  WORLD_LEN, ROAD_HALF, BARRIER_X,
+  MAP_MIN_Z, MAP_MAX_Z, MAP_MIN_X, MAP_MAX_X,
+  CURVE_FREQ, CURVE_AMP, CURVE_FREQ2, CURVE_AMP2, CURVE_FREQ3, CURVE_AMP3,
+  ROAD_SEG_LEN, ROAD_SEG_COUNT,
 });
 </script>
 </body>
